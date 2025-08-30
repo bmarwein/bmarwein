@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # =========[ SkyOps Swarm - Bootstrap WIFI -> ETH ]=========
-# But : lancer en SSH via Wi-Fi, basculer le nœud sur ETH (VLAN10),
-#       couper le Wi-Fi en sécurité, puis reboot.
-# Usage : sudo ./bootstrap-wifi-to-eth.sh [--iface IFACE] [--no-upgrade] [--keep-wifi]
+# Usage :
+#   sudo ./bootstrap-wifi-to-eth.sh [--iface IFACE] [--no-upgrade] [--keep-wifi] [--wifi-backup]
+# --keep-wifi    : laisse le Wi-Fi tel quel (par défaut il est coupé après succès ETH)
+# --wifi-backup  : garde le Wi-Fi mais SANS gateway, jamais route par défaut (secours SSH)
 # ===========================================================
 
 GATEWAY="10.10.0.1"
@@ -13,9 +14,12 @@ DNS_SECONDARY="1.1.1.1"
 CON_NAME="vlan10"
 IP_PREFIX="/24"
 PING_TIMEOUT=2
-ETH_LINK_WAIT=20   # secondes pour attendre le link up d'eth0
+ETH_LINK_WAIT=20
 
-# Table hostname -> IP
+# Route metrics : plus petit = plus prioritaire
+ETH_METRIC=100
+WIFI_METRIC=600
+
 declare -A HOST_IP_MAP=(
   [mpc-manager-01]="10.10.0.10"
   [pi5-master-01]="10.10.0.11"
@@ -28,17 +32,19 @@ declare -A HOST_IP_MAP=(
   [pi4-worker-04]="10.10.0.34"
 )
 
-# Options
 IFACE=""
 DO_UPGRADE="true"
 KEEP_WIFI="false"
+WIFI_BACKUP="false"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --iface) IFACE="${2:-}"; shift 2 ;;
     --no-upgrade) DO_UPGRADE="false"; shift ;;
     --keep-wifi) KEEP_WIFI="true"; shift ;;
+    --wifi-backup) WIFI_BACKUP="true"; KEEP_WIFI="true"; shift ;;
     -h|--help)
-      echo "Usage: sudo $0 [--iface IFACE] [--no-upgrade] [--keep-wifi]"
+      echo "Usage: sudo $0 [--iface IFACE] [--no-upgrade] [--keep-wifi] [--wifi-backup]"
       exit 0 ;;
     *) echo "Option inconnue: $1"; exit 1 ;;
   esac
@@ -103,11 +109,9 @@ wait_eth_link() {
     sleep 1; ((i++))
   done
   warn "Link $IFACE toujours DOWN (câble/port ?) — on continue quand même."
-  return 0
 }
 
 nm_cleanup_eth_profiles() {
-  # Supprime autres profils ethernet (évite la reprise DHCP)
   while IFS= read -r name; do
     [[ "$name" == "$CON_NAME" ]] && continue
     log "Suppression profil ethernet existant : $name"
@@ -118,7 +122,7 @@ nm_cleanup_eth_profiles() {
 
 apply_static_eth() {
   local ip="$1"
-  log "Création/modif profil $CON_NAME sur $IFACE → $ip$IP_PREFIX (GW $GATEWAY, DNS $DNS_PRIMARY $DNS_SECONDARY)"
+  log "Profil $CON_NAME sur $IFACE → $ip$IP_PREFIX (GW $GATEWAY, DNS $DNS_PRIMARY $DNS_SECONDARY, metric $ETH_METRIC)"
   if nmcli -t -f NAME con show | grep -Fx "$CON_NAME" >/dev/null 2>&1; then
     nmcli con mod "$CON_NAME" \
       connection.interface-name "$IFACE" \
@@ -127,12 +131,40 @@ apply_static_eth() {
       ipv4.addresses "$ip$IP_PREFIX" \
       ipv4.gateway "$GATEWAY" \
       ipv4.dns "$DNS_PRIMARY $DNS_SECONDARY" \
+      ipv4.route-metric "$ETH_METRIC" \
       ipv6.method ignore
   else
     nmcli con add type ethernet ifname "$IFACE" con-name "$CON_NAME" ip4 "$ip$IP_PREFIX" gw4 "$GATEWAY"
-    nmcli con mod "$CON_NAME" ipv4.dns "$DNS_PRIMARY $DNS_SECONDARY" ipv6.method ignore connection.autoconnect yes
+    nmcli con mod "$CON_NAME" ipv4.dns "$DNS_PRIMARY $DNS_SECONDARY" ipv6.method ignore connection.autoconnect yes ipv4.route-metric "$ETH_METRIC"
   fi
   nmcli con up "$CON_NAME"
+}
+
+configure_wifi_backup() {
+  # Met TOUS les profils Wi-Fi en "secours" : pas de défaut, pas de gateway, metric élevé
+  local changed="false"
+  while IFS= read -r wname; do
+    changed="true"
+    log "Configuration Wi-Fi secours pour le profil : $wname"
+    nmcli con mod "$wname" \
+      ipv4.never-default yes \
+      ipv4.gateway "" \
+      ipv4.route-metric "$WIFI_METRIC" \
+      ipv6.method ignore \
+      connection.autoconnect yes || true
+
+    # Si le profil est up, on le recycle pour appliquer les routes
+    nmcli -g GENERAL.STATE con show "$wname" | grep -q "activated" && {
+      nmcli con down "$wname" || true
+      nmcli con up "$wname" || true
+    }
+  done < <(nmcli -t -f NAME,TYPE con show | awk -F: '$2=="wifi"{print $1}')
+
+  if [[ "$changed" == "false" ]]; then
+    warn "Aucun profil Wi-Fi trouvé. Rien à faire pour le backup Wi-Fi."
+  else
+    log "Wi-Fi en mode secours configuré (no default route, metric $WIFI_METRIC)."
+  fi
 }
 
 verify_paths() {
@@ -148,12 +180,12 @@ verify_paths() {
   getent hosts google.com || warn "DNS non résolu — vérifier DNS."
 }
 
-disable_wifi_then_reboot() {
+maybe_disable_wifi_and_reboot() {
   if [[ "$KEEP_WIFI" == "true" ]]; then
-    warn "--keep-wifi actif → le Wi-Fi reste opérationnel. Pas de reboot forcé."
+    warn "--keep-wifi actif → le Wi-Fi reste opérationnel."
     return 0
   fi
-  # Trouver profils Wi-Fi et les désactiver proprement
+  # Sinon on désactive tout Wi-Fi
   while IFS= read -r wname; do
     log "Désactivation autoconnect Wi-Fi : $wname"
     nmcli con mod "$wname" connection.autoconnect no || true
@@ -176,12 +208,20 @@ main() {
   local ip; ip="$(resolve_ip)"
   nm_cleanup_eth_profiles
   apply_static_eth "$ip"
+
+  if [[ "$WIFI_BACKUP" == "true" ]]; then
+    configure_wifi_backup   # garde le Wi-Fi mais sans gateway / never-default
+  fi
+
   verify_paths "$ip"
 
   echo
   log "Résumé : hostname=$(hostname -s)  iface=$IFACE  ip=$ip$IP_PREFIX  gw=$GATEWAY  dns=$DNS_PRIMARY,$DNS_SECONDARY"
+  echo "Routes en place :"
+  ip route | sed 's/^/  /'
   echo
-  disable_wifi_then_reboot
+
+  maybe_disable_wifi_and_reboot
 }
 
 main "$@"
